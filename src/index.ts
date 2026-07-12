@@ -32,6 +32,25 @@ export interface AnalyticsConfig {
   samplingRate?: number;
 }
 
+export interface RetryConfig {
+  /** Backoff base for the first reconnect attempt. Defaults to 1_000ms. */
+  baseDelayMs?: number;
+  /** Backoff ceiling. Defaults to 60_000ms. */
+  maxDelayMs?: number;
+  /**
+   * Treat the stream as dead after this much silence. The server heartbeats
+   * every 30s, so the default (90_000ms) tolerates two missed beats before
+   * reconnecting.
+   */
+  heartbeatTimeoutMs?: number;
+  /**
+   * Set to false to restore the legacy behavior: any stream failure downgrades
+   * to polling for the rest of the subscription, with no SSE reconnects.
+   * Defaults to true.
+   */
+  enabled?: boolean;
+}
+
 export interface ShipSilentlyConfig {
   apiKey: string;
   /** Defaults to the production ShipSilently API */
@@ -40,7 +59,19 @@ export interface ShipSilentlyConfig {
   fetch?: typeof globalThis.fetch;
   /** Analytics submission settings — see AnalyticsConfig. */
   analytics?: AnalyticsConfig;
+  /** Reconnect/backoff behavior — see RetryConfig. */
+  retry?: RetryConfig;
 }
+
+/**
+ * Connection state reported through `stream()`'s `onStateChange`:
+ * - `streaming`: live SSE connection established.
+ * - `reconnecting`: stream lost; polling keeps data fresh while SSE reconnect
+ *   attempts continue with backoff.
+ * - `polling`: polling is the terminal mode for this subscription (free plan,
+ *   no EventSource in the runtime, or `retry.enabled: false` after a failure).
+ */
+export type StreamConnectionState = 'streaming' | 'polling' | 'reconnecting';
 
 export type FlagsUpdateCallback = (flags: Record<string, EvaluationResult>) => void;
 
@@ -58,6 +89,17 @@ const DEFAULT_FLUSH_INTERVAL_MS = 30_000;
 const DEFAULT_MAX_BATCH_SIZE = 100;
 const DEFAULT_MAX_BUFFER_SIZE = 5_000;
 const MIN_FLUSH_INTERVAL_MS = 1_000;
+const DEFAULT_RETRY_BASE_DELAY_MS = 1_000;
+const DEFAULT_RETRY_MAX_DELAY_MS = 60_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 90_000;
+/**
+ * How long a stream connection must stay up before the backoff ladder resets.
+ * Resetting on `connected` alone would let a server that accepts and
+ * immediately drops connections get hammered at the base delay forever.
+ */
+const HEALTHY_CONNECTION_RESET_MS = 30_000;
+/** A retrying SDK must not turn one incident into thousands of log lines. */
+const WARN_DEDUP_INTERVAL_MS = 60_000;
 /**
  * The ingestion endpoint rejects batches larger than this with a 400 (see
  * `ingestSchema` in the worker's analytics route). A single flush may need to
@@ -86,11 +128,19 @@ export class ShipSilentlyClient {
   private analyticsConfig: Required<AnalyticsConfig>;
   private analyticsBuffer: PendingAnalyticsEvent[] = [];
   private analyticsTimer: ReturnType<typeof setInterval> | null = null;
+  private retryConfig: Required<RetryConfig>;
+  private lastWarnAt = new Map<string, number>();
 
   constructor(config: ShipSilentlyConfig) {
     this.apiKey = config.apiKey;
     this.apiUrl = (config.apiUrl ?? DEFAULT_API_URL).replace(/\/$/, '');
     this.fetch = config.fetch ?? globalThis.fetch;
+    this.retryConfig = {
+      baseDelayMs: config.retry?.baseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
+      maxDelayMs: config.retry?.maxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS,
+      heartbeatTimeoutMs: config.retry?.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS,
+      enabled: config.retry?.enabled ?? true,
+    };
     this.analyticsConfig = {
       enabled: config.analytics?.enabled ?? true,
       flushIntervalMs: Math.max(
@@ -131,7 +181,12 @@ export class ShipSilentlyClient {
 
   /**
    * Evaluate a single feature flag for a user context.
-   * Returns `defaultValue` if the flag is not found or a network error occurs.
+   *
+   * Single network attempt — this sits on the caller's request path, so it
+   * never retries. On any failure other than a definitive 404 it serves the
+   * last-known-good cached value (hydrated by `evaluateAll()`/`stream()`)
+   * before falling back to `defaultValue`. That includes 401/403: an auth
+   * error is never allowed to degrade a value the SDK already holds.
    */
   async evaluate<T extends FlagValue>(flagKey: string, context: UserContext, defaultValue: T): Promise<T> {
     const startedAt = nowMs();
@@ -143,43 +198,67 @@ export class ShipSilentlyClient {
       });
       if (!res.ok) {
         if (res.status === 401 || res.status === 403) {
-          console.warn(
-            `[ShipSilently] Authentication failed (${res.status}) for flag "${flagKey}". Check your API key.`,
+          this.warnDeduped(
+            'auth:evaluate',
+            `[ShipSilently] Authentication failed (${res.status}) for flag "${flagKey}". Serving last-known-good values. Check your API key if this persists.`,
           );
         }
-        // The server records nothing for a failed evaluation, so this default
-        // that the SDK served locally is a flag check only the client can
-        // count. 404 keeps the server's `flag_not_found` reason; other
-        // failures (429/5xx) are `error_fallback` — the flag may exist, the
-        // request just didn't succeed.
-        this.recordEvaluation({
-          flagKey,
-          variationKey: variationKeyFromValue(defaultValue as FlagValue),
-          reason: res.status === 404 ? 'flag_not_found' : 'error_fallback',
-          latencyMs: nowMs() - startedAt,
-          timestamp: Math.floor(Date.now() / 1000),
-        });
-        return defaultValue;
+        if (res.status === 404) {
+          // Definitive answer: the flag doesn't exist. The server records
+          // nothing for a failed evaluation, so this locally-served default
+          // is a flag check only the client can count.
+          this.recordEvaluation({
+            flagKey,
+            variationKey: variationKeyFromValue(defaultValue as FlagValue),
+            reason: 'flag_not_found',
+            latencyMs: nowMs() - startedAt,
+            timestamp: Math.floor(Date.now() / 1000),
+          });
+          return defaultValue;
+        }
+        return this.serveStale(flagKey, defaultValue, startedAt);
       }
       const data = await res.json() as EvaluationResult;
+      // Cache the success so a later failure (outage, 401) can serve this as
+      // last-known-good — an app that only ever calls evaluate() must still
+      // build a cache, otherwise it degrades straight to defaults during an
+      // incident, the exact regression this SDK exists to prevent.
+      this.cache[flagKey] = data;
       // No client event on success: the server already recorded this
       // evaluation (source=server). Recording it here too would double-count
       // every networked check on the dashboard.
       return data.value as T;
     } catch {
-      this.recordEvaluation({
-        flagKey,
-        variationKey: variationKeyFromValue(defaultValue as FlagValue),
-        reason: 'error_fallback',
-        latencyMs: nowMs() - startedAt,
-        timestamp: Math.floor(Date.now() / 1000),
-      });
-      return defaultValue;
+      return this.serveStale(flagKey, defaultValue, startedAt);
     }
   }
 
   /**
+   * Serve the last-known-good cached value for a flag (or `defaultValue` when
+   * the cache has never been hydrated) after a failed evaluation. Recorded as
+   * `error_fallback` — the flag may exist, the request just didn't succeed.
+   */
+  private serveStale<T extends FlagValue>(flagKey: string, defaultValue: T, startedAt: number): T {
+    const hit = this.cache[flagKey];
+    const value = hit ? (hit.value as T) : defaultValue;
+    this.recordEvaluation({
+      flagKey,
+      variationKey: variationKeyFromValue(value as FlagValue),
+      reason: 'error_fallback',
+      latencyMs: nowMs() - startedAt,
+      timestamp: Math.floor(Date.now() / 1000),
+    });
+    return value;
+  }
+
+  /**
    * Evaluate all flags for a user context in a single network call.
+   *
+   * The local cache is only ever replaced by a successful response. On any
+   * failure — network, 5xx, and explicitly 401/403 — the last-known-good
+   * cache is returned untouched, so subscribers never regress to an empty
+   * flag map because the control plane had a bad moment. Single attempt: the
+   * poll/reconnect loop in `stream()` is this call's retry cadence.
    */
   async evaluateAll(context: UserContext): Promise<Record<string, EvaluationResult>> {
     try {
@@ -190,11 +269,12 @@ export class ShipSilentlyClient {
       });
       if (!res.ok) {
         if (res.status === 401 || res.status === 403) {
-          console.warn(
-            `[ShipSilently] Authentication failed (${res.status}) for evaluateAll. Check your API key.`,
+          this.warnDeduped(
+            'auth:evaluateAll',
+            `[ShipSilently] Authentication failed (${res.status}) for evaluateAll. Serving last-known-good values. Check your API key if this persists.`,
           );
         }
-        return {};
+        return { ...this.cache };
       }
       const data = await res.json() as { flags: Record<string, EvaluationResult> };
       this.cache = data.flags;
@@ -203,7 +283,7 @@ export class ShipSilentlyClient {
       // counted by get() as they happen.
       return data.flags;
     } catch {
-      return {};
+      return { ...this.cache };
     }
   }
 
@@ -214,21 +294,47 @@ export class ShipSilentlyClient {
    * changes. The SDK reacts by re-running `evaluateAll(context)` to refresh
    * the local cache, then invokes `onChange` with the new flag map.
    *
-   * Falls back to polling `evaluateAll` on EventSource failure or when
-   * `EventSource` is unavailable (e.g. server-side runtimes).
+   * The subscription has no terminal failure state. On any stream error —
+   * including auth errors (401/403), which can be transient (key rotation
+   * races, control-plane incidents) — the SDK polls `evaluateAll` to keep
+   * data fresh while reconnecting with full-jitter exponential backoff.
+   * It never gives up and never requires an application restart. The only
+   * cases that settle into polling-only are a 402 feature gate (free plan),
+   * a runtime without `EventSource`, or `retry.enabled: false`.
+   *
+   * A server `heartbeat` event every 30s keeps the connection observable; a
+   * watchdog reconnects when the stream has been silent past
+   * `retry.heartbeatTimeoutMs`.
    *
    * Returns an `unsubscribe` function — call it to close the connection.
    */
   stream(
     context: UserContext,
     onChange: FlagsUpdateCallback,
-    options: { pollingIntervalMs?: number } = {},
+    options: {
+      pollingIntervalMs?: number;
+      onStateChange?: (state: StreamConnectionState) => void;
+    } = {},
   ): () => void {
     const pollingMs = options.pollingIntervalMs ?? 30_000;
+    const retry = this.retryConfig;
 
     let es: EventSource | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+    let healthyTimer: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
+    let attempt = 0;
+    let lastEventAt = 0;
+    let state: StreamConnectionState | null = null;
+    let hadFailure = false;
+
+    const setState = (next: StreamConnectionState) => {
+      if (closed || state === next) return;
+      state = next;
+      options.onStateChange?.(next);
+    };
 
     const refresh = async () => {
       if (closed) return;
@@ -239,13 +345,82 @@ export class ShipSilentlyClient {
     const startPolling = () => {
       if (pollTimer || closed) return;
       pollTimer = setInterval(refresh, pollingMs);
+      unrefTimer(pollTimer);
     };
 
-    const tryStream = async () => {
+    const stopPolling = () => {
+      if (!pollTimer) return;
+      clearInterval(pollTimer);
+      pollTimer = null;
+    };
+
+    const teardownStream = () => {
+      es?.close();
+      es = null;
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
+      if (healthyTimer) {
+        clearTimeout(healthyTimer);
+        healthyTimer = null;
+      }
+    };
+
+    // Terminal polling mode: feature gate (402), no EventSource in this
+    // runtime, or retries disabled. Not a failure state — data stays fresh.
+    const pollOnly = () => {
+      void refresh();
+      startPolling();
+      setState('polling');
+    };
+
+    const scheduleReconnect = () => {
+      if (closed) return;
+      hadFailure = true;
+      if (!retry.enabled) {
+        // Legacy behavior: downgrade to polling for the subscription's life.
+        pollOnly();
+        return;
+      }
+      // Poll while disconnected so flag data stays fresh between attempts.
+      void refresh();
+      startPolling();
+      setState('reconnecting');
+      // Full jitter: delay ∈ [0, min(cap, base·2^attempt)). Jitter spreads a
+      // fleet's reconnects out so recovery doesn't become a thundering herd.
+      const ceiling = Math.min(retry.maxDelayMs, retry.baseDelayMs * 2 ** Math.min(attempt, 30));
+      attempt += 1;
+      const delay = Math.floor(Math.random() * ceiling);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void connect();
+      }, delay);
+      unrefTimer(reconnectTimer);
+    };
+
+    const startWatchdog = () => {
+      const checkMs = Math.max(1_000, Math.floor(retry.heartbeatTimeoutMs / 3));
+      watchdogTimer = setInterval(() => {
+        if (!es || Date.now() - lastEventAt <= retry.heartbeatTimeoutMs) return;
+        // The server heartbeats every 30s; silence past the timeout means the
+        // socket died without an error event (e.g. dropped by a middlebox).
+        this.warnDeduped(
+          'stream:stale',
+          '[ShipSilently] Stream silent past heartbeat timeout — reconnecting.',
+        );
+        teardownStream();
+        scheduleReconnect();
+      }, checkMs);
+      unrefTimer(watchdogTimer);
+    };
+
+    const connect = async () => {
+      if (closed) return;
       if (typeof EventSource === 'undefined') {
-        // Prime the cache, then poll on an interval
-        void refresh();
-        startPolling();
+        // No SSE in this runtime. Polling plus the never-cleared-on-error
+        // cache keeps this mode restart-free too.
+        pollOnly();
         return;
       }
 
@@ -253,65 +428,120 @@ export class ShipSilentlyClient {
       // the connection directly — and it must never go on the URL as a query
       // string (it would leak into logs, proxy caches and browser history).
       // Exchange the header-authenticated key for a single-use ticket and put
-      // *that* on the EventSource URL instead.
+      // *that* on the EventSource URL instead. The ticket is fetched *after*
+      // any backoff wait (never before) so its 60s TTL can't lapse mid-sleep.
       const ticket = await this.fetchStreamTicket();
       if (closed) return;
-      if (!ticket) {
-        // No ticket (network error, free plan, etc.) — fall back to polling.
-        void refresh();
-        startPolling();
+
+      if (!ticket.ok) {
+        if (ticket.status === 402) {
+          // Streaming isn't in this plan — a feature gate, not an outage.
+          // Poll; don't retry SSE against a door that's closed on purpose.
+          pollOnly();
+          return;
+        }
+        if (ticket.status === 401 || ticket.status === 403) {
+          this.warnDeduped(
+            'auth:stream',
+            `[ShipSilently] Stream auth failed (${ticket.status}). Retrying with backoff — auth errors can be transient (key rotation, control-plane incidents) and are never treated as fatal. Check your API key if this persists.`,
+          );
+        }
+        scheduleReconnect();
         return;
       }
 
-      const url = `${this.apiUrl}/v1/stream?ticket=${encodeURIComponent(ticket)}`;
-      es = new EventSource(url);
+      const url = `${this.apiUrl}/v1/stream?ticket=${encodeURIComponent(ticket.ticket)}`;
+      const self = new EventSource(url);
+      es = self;
+      lastEventAt = Date.now();
+      startWatchdog();
 
       // Prime the cache as soon as the connection is open so subscribers
       // have flag state at t=0 without waiting for the first mutation.
-      es.addEventListener('connected', () => {
+      self.addEventListener('connected', () => {
+        lastEventAt = Date.now();
+        stopPolling();
+        setState('streaming');
+        if (hadFailure) {
+          // Deduped like the warnings, so a flapping connection doesn't spam
+          // one recovery line per reconnect.
+          this.warnDeduped('stream:recovered', '[ShipSilently] Stream connection recovered.', console.info);
+          hadFailure = false;
+        }
+        // Reset the backoff ladder only once the connection proves healthy.
+        healthyTimer = setTimeout(() => {
+          attempt = 0;
+        }, HEALTHY_CONNECTION_RESET_MS);
+        unrefTimer(healthyTimer);
         void refresh();
       });
 
-      es.addEventListener('flags.updated', () => {
+      self.addEventListener('flags.updated', () => {
+        lastEventAt = Date.now();
         void refresh();
       });
 
-      es.onerror = () => {
-        es?.close();
-        es = null;
-        // Fall back to polling on SSE error (e.g. free plan 402)
-        void refresh();
-        startPolling();
+      self.addEventListener('heartbeat', () => {
+        lastEventAt = Date.now();
+      });
+
+      // Guard against a late error from a torn-down EventSource: once we've
+      // replaced `es` with a newer connection (or closed), an old socket's
+      // queued error must not tear down the live one.
+      self.onerror = () => {
+        if (closed || es !== self) return;
+        teardownStream();
+        scheduleReconnect();
       };
     };
 
-    void tryStream();
+    void connect();
 
     return () => {
       closed = true;
-      es?.close();
-      if (pollTimer) clearInterval(pollTimer);
+      teardownStream();
+      stopPolling();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
     };
   }
 
   /**
    * Exchange the API key (sent in the X-API-Key header) for a single-use,
-   * short-lived stream ticket. Returns null on any failure so the caller can
-   * fall back to polling. The ticket — not the key — goes on the EventSource
-   * URL, keeping the standing secret out of logs and browser history.
+   * short-lived stream ticket. The ticket — not the key — goes on the
+   * EventSource URL, keeping the standing secret out of logs and browser
+   * history. Failures preserve the HTTP status so the caller can distinguish
+   * a feature gate (402 → poll) from an auth error or outage (retry).
    */
-  private async fetchStreamTicket(): Promise<string | null> {
+  private async fetchStreamTicket(): Promise<
+    { ok: true; ticket: string } | { ok: false; status: number | null }
+  > {
     try {
       const res = await this.fetch(`${this.apiUrl}/v1/stream/ticket`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-API-Key': this.apiKey },
       });
-      if (!res.ok) return null;
+      if (!res.ok) return { ok: false, status: res.status };
       const data = (await res.json()) as { ticket?: string };
-      return data.ticket ?? null;
+      return data.ticket ? { ok: true, ticket: data.ticket } : { ok: false, status: null };
     } catch {
-      return null;
+      return { ok: false, status: null };
     }
+  }
+
+  /**
+   * Log at most once per `WARN_DEDUP_INTERVAL_MS` per key. State transitions
+   * get one line; a flapping connection repeats at most once a minute instead
+   * of once per retry. `log` defaults to `console.warn`; the recovery line
+   * passes `console.info`.
+   */
+  private warnDeduped(key: string, message: string, log: (msg: string) => void = console.warn): void {
+    const now = Date.now();
+    if (now - (this.lastWarnAt.get(key) ?? 0) < WARN_DEDUP_INTERVAL_MS) return;
+    this.lastWarnAt.set(key, now);
+    log(message);
   }
 
   // ─── Analytics ──────────────────────────────────────────────────────────────
@@ -408,11 +638,15 @@ export class ShipSilentlyClient {
     this.analyticsTimer = setInterval(() => {
       void this.flushAnalytics();
     }, this.analyticsConfig.flushIntervalMs);
-    // In Node-like environments, setInterval keeps the event loop alive. Use
-    // unref() if available so a hanging timer doesn't block process exit.
-    const t = this.analyticsTimer as { unref?: () => void } | null;
-    if (t && typeof t.unref === 'function') t.unref();
+    unrefTimer(this.analyticsTimer);
   }
+}
+
+// In Node-like environments, setInterval/setTimeout keep the event loop
+// alive. Use unref() where available so SDK timers never block process exit.
+function unrefTimer(timer: unknown): void {
+  const t = timer as { unref?: () => void } | null;
+  if (t && typeof t.unref === 'function') t.unref();
 }
 
 function nowMs(): number {
