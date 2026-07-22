@@ -52,7 +52,7 @@ if (checkoutV2) {
 const all = await client.evaluateAll({ userId: 'user_123', plan: 'pro' });
 ```
 
-See the [ShipSilently docs](https://shipsilently.com) for the full API.
+See the [JavaScript / TypeScript SDK docs](https://www.shipsilently.com/docs/javascript/) for the full API.
 
 ## License
 
